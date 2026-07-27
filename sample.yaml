@@ -1,12 +1,16 @@
 sample:
-  name: Blinky Sample
+  name: NOHRD Bike Controller
 tests:
-  sample.basic.blinky:
+  app.nohrd_bike:
     tags:
-      - LED
+      - bike
+      - display
+      - bluetooth
       - gpio
-    filter: dt_enabled_alias_with_parent_compat("led0", "gpio-leds")
-    depends_on: gpio
+    depends_on:
+      - gpio
+      - adc
+      - bluetooth
     harness: led
     integration_platforms:
-      - frdm_k64f
+      - nrf52dk_nrf52832
