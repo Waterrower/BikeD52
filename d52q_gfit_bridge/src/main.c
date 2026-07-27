@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 
@@ -8,6 +9,7 @@
 #include "gfit_protocol.h"
 
 #define UART_DEVICE_NODE DT_NODELABEL(uart0)
+#define USER_NODE DT_PATH(zephyr_user)
 #define UART_RX_RING_SIZE 256
 #define GFIT_POLL_MS 5
 
@@ -40,10 +42,15 @@ struct bike_metrics {
 };
 
 static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
+static const struct gpio_dt_spec gfit_sleep =
+	GPIO_DT_SPEC_GET(USER_NODE, gfit_sleep_gpios);
+static const struct gpio_dt_spec gfit_reset =
+	GPIO_DT_SPEC_GET(USER_NODE, gfit_reset_gpios);
 static struct ring_buffer uart_rx;
 static struct gfit_parser parser;
 static struct bike_metrics last_metrics;
 static bool bridge_ready;
+static bool gfit_control_active;
 
 static bool ring_is_empty(const struct ring_buffer *ring)
 {
@@ -243,6 +250,10 @@ static void handle_gfit_command(const uint8_t *payload, size_t length)
 
 static void handle_gfit_payload(const uint8_t *payload, size_t length)
 {
+	if (!gfit_control_active) {
+		return;
+	}
+
 	if (length == 0U) {
 		return;
 	}
@@ -276,7 +287,60 @@ static void uart_irq_handler(const struct device *dev, void *user_data)
 
 static void ble_connection_changed(bool connected)
 {
+	if (!gfit_control_active) {
+		return;
+	}
+
 	gfit_send_peripheral_event(connected);
+}
+
+static bool gfit_control_pins_active(void)
+{
+	bool awake = true;
+	bool reset_released = true;
+
+	if (gpio_is_ready_dt(&gfit_sleep)) {
+		awake = gpio_pin_get_dt(&gfit_sleep) == 0;
+	}
+
+	if (gpio_is_ready_dt(&gfit_reset)) {
+		reset_released = gpio_pin_get_dt(&gfit_reset) > 0;
+	}
+
+	return awake && reset_released;
+}
+
+static void update_gfit_control_state(void)
+{
+	bool active = gfit_control_pins_active();
+
+	if (active == gfit_control_active) {
+		return;
+	}
+
+	gfit_control_active = active;
+	if (active) {
+		gfit_parser_init(&parser);
+		bridge_ready = true;
+		(void)ble_ftms_set_enabled(true);
+		gfit_send_boot_event();
+	} else {
+		bridge_ready = false;
+		(void)ble_ftms_set_enabled(false);
+		gfit_parser_init(&parser);
+		uart_rx.start = uart_rx.end;
+	}
+}
+
+static void init_gfit_control_pins(void)
+{
+	if (gpio_is_ready_dt(&gfit_sleep)) {
+		(void)gpio_pin_configure_dt(&gfit_sleep, GPIO_INPUT);
+	}
+
+	if (gpio_is_ready_dt(&gfit_reset)) {
+		(void)gpio_pin_configure_dt(&gfit_reset, GPIO_INPUT);
+	}
 }
 
 static void process_uart(void)
@@ -301,6 +365,7 @@ int main(void)
 	}
 
 	gfit_parser_init(&parser);
+	init_gfit_control_pins();
 
 	ret = uart_irq_callback_user_data_set(uart_dev, uart_irq_handler, NULL);
 	if (ret < 0) {
@@ -309,11 +374,10 @@ int main(void)
 	uart_irq_rx_enable(uart_dev);
 
 	(void)ble_ftms_init(ble_connection_changed);
-	(void)ble_ftms_set_enabled(true);
-	bridge_ready = true;
-	gfit_send_boot_event();
+	update_gfit_control_state();
 
 	while (1) {
+		update_gfit_control_state();
 		process_uart();
 		ARG_UNUSED(bridge_ready);
 		k_msleep(GFIT_POLL_MS);

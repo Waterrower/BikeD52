@@ -41,6 +41,19 @@ The Atmega cannot be OTA updated, so compatibility pressure belongs on this
 bridge firmware. Initial flashing still needs a programmer once so MCUboot is
 present; after that, updates should go over BLE MCUmgr / nRF Connect.
 
+## D52Q Wiring
+
+Known D52Q pins for the GFIT replacement:
+
+- P0.16: RX at D52Q, connected to Atmega GFIT TX.
+- P0.17: TX at D52Q, connected to Atmega GFIT RX.
+- P0.07: Sleep input from Atmega, active high.
+- P0.21: Reset input from Atmega, active low.
+
+The old Atmega code woke GFIT by driving Sleep low and Reset high. The bridge
+should keep BLE disabled while Sleep is high or Reset is asserted, then send a
+GFIT boot event when the module becomes active again.
+
 ## Legacy GFIT Summary
 
 From `src/atmegamain.c`, GFIT handled:

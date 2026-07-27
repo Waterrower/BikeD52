@@ -51,11 +51,15 @@ Hardware Defaults
 
 The current overlay uses UART0 at 9600 baud:
 
-- TX P0.06
-- RX P0.08
+- RX on D52Q P0.16
+- TX on D52Q P0.17
+- Sleep input on D52Q P0.07, active high
+- Reset input on D52Q P0.21, active low
 
-These pins are placeholders copied from the current development setup and must
-be checked against the D52Q-to-Atmega wiring before flashing hardware.
+The old Atmega GFIT enable sequence drives Sleep low and Reset high when the
+module should run. The bridge mirrors that behavior: BLE is enabled only while
+Sleep is low and Reset is released. When the lines return active, the bridge
+sends a GFIT boot event again.
 
 Build
 *****
