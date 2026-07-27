@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <stddef.h>
+#include <string.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
@@ -10,6 +11,7 @@
 #define BT_UUID_FTMS_VAL 0x1826
 #define BT_UUID_FTMS_FEATURE_VAL 0x2acc
 #define BT_UUID_INDOOR_BIKE_DATA_VAL 0x2ad2
+#define DEVICE_NAME_MAX 20
 
 static struct bt_conn *current_conn;
 static bool bt_ready;
@@ -17,6 +19,7 @@ static bool ftms_enabled;
 static bool ftms_advertising;
 static bool indoor_bike_notify_enabled;
 static ble_ftms_conn_cb_t connection_cb;
+static char device_name[DEVICE_NAME_MAX + 1U] = CONFIG_BT_DEVICE_NAME;
 
 static const struct bt_uuid_16 ftms_uuid = BT_UUID_INIT_16(BT_UUID_FTMS_VAL);
 static const struct bt_uuid_16 ftms_feature_uuid =
@@ -32,11 +35,6 @@ static const uint8_t ftms_feature[8] = {
 static const struct bt_data advertising_data[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(BT_UUID_FTMS_VAL)),
-};
-
-static const struct bt_data scan_response_data[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
-		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
 static ssize_t read_ftms_feature(struct bt_conn *conn,
@@ -70,6 +68,13 @@ BT_GATT_SERVICE_DEFINE(ftms_service,
 
 static int start_advertising(void)
 {
+	const struct bt_data scan_response_data[] = {
+		{
+			.type = BT_DATA_NAME_COMPLETE,
+			.data_len = (uint8_t)strlen(device_name),
+			.data = (const uint8_t *)device_name,
+		},
+	};
 	int err;
 
 	if (!bt_ready || ftms_advertising || current_conn != NULL) {
@@ -210,6 +215,32 @@ int ble_ftms_set_enabled(bool enabled)
 bool ble_ftms_is_enabled(void)
 {
 	return ftms_enabled;
+}
+
+int ble_ftms_set_name(const char *name)
+{
+	size_t length;
+	bool restart_adv = ftms_advertising;
+	int err = 0;
+
+	if (name == NULL || name[0] == '\0') {
+		return -EINVAL;
+	}
+
+	length = MIN(strlen(name), DEVICE_NAME_MAX);
+	memcpy(device_name, name, length);
+	device_name[length] = '\0';
+
+	if (bt_ready) {
+		err = bt_set_name(device_name);
+	}
+
+	if (restart_adv) {
+		(void)stop_advertising();
+		err = start_advertising();
+	}
+
+	return err;
 }
 
 bool ble_ftms_is_connected(void)

@@ -70,6 +70,29 @@ From `src/atmegamain.c`, GFIT handled:
 - Metric forwarding for FTMS-style data: cadence, resistance, power, speed,
   distance.
 
+## Atmega Boot Init Sequence
+
+At boot or when Bluetooth is enabled, the old Atmega runs
+`startup_bluetooth_new()` and sends GFIT commands sequentially:
+
+- `e2 e0 ...`: set equipment. For BIKE the equipment type observed in the old
+  code is `25`; for SPRINTBOK it is `19`.
+- `e2 e1 ...`: set the metric template. BIKE configures cadence, resistance,
+  power, speed, and distance-like fields.
+- `e2 e4 05 ...`: set product / advertising name. BIKE sends `NOHRDNB`,
+  Ciclotte sends `NOHRDNC`, SPRINTBOK sends `NOHRDSP`.
+- `e2 e4 06 ...`: set manufacturer name, observed as `Waterrower GmbH`.
+- `e2 e4 04 ...`: set firmware revision bytes.
+- `e2 e4 02 ...`: set hardware revision bytes.
+- `e2 d1 03 ...`: set channel mode. Old code comments map masks to BLE, ANT,
+  or BOTH.
+- `e2 e5 00/01`: HR pairing configuration, not BLE on/off.
+- `e2 d0 ...`: state transition. The old startup ends by transitioning GFIT to
+  Ready.
+
+The bridge should accept all of these in order, remember the resulting
+configuration, and advertise with the product name supplied by the Atmega.
+
 ## Current Implementation Scope
 
 The first bridge version implements only:

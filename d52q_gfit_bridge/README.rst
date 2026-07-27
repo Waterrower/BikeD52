@@ -43,6 +43,9 @@ Implemented now:
 - Boot event ``6f`` on startup.
 - Generic success/fail responses for legacy custom handshakes.
 - BLE connection/disconnection event toward Atmega.
+- Parsing and storing of the Atmega startup configuration sequence:
+  equipment type, metric template, product/advertising name, manufacturer,
+  hardware/firmware revisions, channel mode, HR pairing config, and state.
 - Parsing of legacy metric packets beginning with ``e2 e1``.
 - FTMS Indoor Bike Data notifications from those metrics.
 

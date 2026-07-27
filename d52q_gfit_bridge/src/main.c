@@ -23,10 +23,26 @@
 #define GFIT_COMMAND 0xe2
 #define GFIT_CUSTOM_PROTOCOL 0xfe
 
+#define GFIT_CMD_SET_EQUIPMENT 0xe0
+#define GFIT_CMD_SET_METRICS 0xe1
+#define GFIT_CMD_SET_CHANNEL_CONFIGURATION 0xd1
+#define GFIT_CMD_TRANSITION 0xd0
+#define GFIT_CMD_SET_DEVICE_INFO 0xe4
+#define GFIT_CMD_SET_HRP_PAIRING 0xe5
+#define GFIT_CMD_GET_VERSION 0xd7
+#define GFIT_CMD_HRP_DISCONNECT 0xd9
+
+#define GFIT_DEVICE_INFO_HARDWARE 0x02
+#define GFIT_DEVICE_INFO_FIRMWARE 0x04
+#define GFIT_DEVICE_INFO_PRODUCT 0x05
+#define GFIT_DEVICE_INFO_MANUFACTURER 0x06
+
 #define GFIT_TAG_SPEED 0x21
 #define GFIT_TAG_CADENCE 0x22
 #define GFIT_TAG_POWER 0x2a
 #define GFIT_TAG_RESISTANCE 0x33
+
+#define GFIT_TRANSITION_READY 0x04
 
 struct ring_buffer {
 	uint16_t start;
@@ -41,6 +57,20 @@ struct bike_metrics {
 	int16_t power_watt;
 };
 
+struct gfit_config {
+	uint8_t equipment_type;
+	uint8_t equipment_flags[2];
+	uint8_t channel_selector;
+	uint8_t channel_mask;
+	uint8_t state;
+	uint8_t metric_template[GFIT_PAYLOAD_MAX];
+	uint8_t metric_template_length;
+	char product_name[21];
+	char manufacturer_name[21];
+	char firmware_revision[8];
+	char hardware_revision[8];
+};
+
 static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
 static const struct gpio_dt_spec gfit_sleep =
 	GPIO_DT_SPEC_GET(USER_NODE, gfit_sleep_gpios);
@@ -49,6 +79,10 @@ static const struct gpio_dt_spec gfit_reset =
 static struct ring_buffer uart_rx;
 static struct gfit_parser parser;
 static struct bike_metrics last_metrics;
+static struct gfit_config gfit_config = {
+	.product_name = "N-Bike",
+	.manufacturer_name = "Waterrower GmbH",
+};
 static bool bridge_ready;
 static bool gfit_control_active;
 
@@ -138,6 +172,29 @@ static void gfit_send_peripheral_event(bool connected)
 	gfit_send_payload(payload, sizeof(payload));
 }
 
+static void copy_ascii_field(char *target, size_t target_size,
+			     const uint8_t *source, size_t source_length)
+{
+	size_t length = MIN(source_length, target_size - 1U);
+
+	memcpy(target, source, length);
+	target[length] = '\0';
+}
+
+static void copy_hex_revision(char *target, size_t target_size,
+			      const uint8_t *source, size_t source_length)
+{
+	size_t pos = 0;
+
+	for (size_t i = 0; i < source_length && pos + 2U < target_size; i++) {
+		static const char hex[] = "0123456789ABCDEF";
+
+		target[pos++] = hex[(source[i] >> 4) & 0x0f];
+		target[pos++] = hex[source[i] & 0x0f];
+	}
+	target[pos] = '\0';
+}
+
 static uint16_t get_le16(const uint8_t *data)
 {
 	return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
@@ -219,6 +276,101 @@ static void handle_custom_protocol(const uint8_t *payload, size_t length)
 	gfit_send_response(false);
 }
 
+static void handle_device_info_command(const uint8_t *payload, size_t length)
+{
+	uint8_t info_type;
+	const uint8_t *data;
+	size_t data_length;
+
+	if (length < 4U) {
+		gfit_send_response(false);
+		return;
+	}
+
+	info_type = payload[2];
+	data = &payload[3];
+	data_length = length - 3U;
+
+	switch (info_type) {
+	case GFIT_DEVICE_INFO_PRODUCT:
+		copy_ascii_field(gfit_config.product_name,
+				 sizeof(gfit_config.product_name),
+				 data, data_length);
+		(void)ble_ftms_set_name(gfit_config.product_name);
+		break;
+	case GFIT_DEVICE_INFO_MANUFACTURER:
+		copy_ascii_field(gfit_config.manufacturer_name,
+				 sizeof(gfit_config.manufacturer_name),
+				 data, data_length);
+		break;
+	case GFIT_DEVICE_INFO_FIRMWARE:
+		copy_hex_revision(gfit_config.firmware_revision,
+				  sizeof(gfit_config.firmware_revision),
+				  data, data_length);
+		break;
+	case GFIT_DEVICE_INFO_HARDWARE:
+		copy_hex_revision(gfit_config.hardware_revision,
+				  sizeof(gfit_config.hardware_revision),
+				  data, data_length);
+		break;
+	default:
+		break;
+	}
+
+	gfit_send_response(true);
+}
+
+static void handle_init_command(const uint8_t *payload, size_t length)
+{
+	uint8_t command = payload[1];
+
+	switch (command) {
+	case GFIT_CMD_SET_EQUIPMENT:
+		if (length >= 5U) {
+			gfit_config.equipment_type = payload[2];
+			gfit_config.equipment_flags[0] = payload[3];
+			gfit_config.equipment_flags[1] = payload[4];
+		}
+		gfit_send_response(length >= 3U);
+		break;
+	case GFIT_CMD_SET_METRICS:
+		gfit_config.metric_template_length =
+			(uint8_t)MIN(length, sizeof(gfit_config.metric_template));
+		memcpy(gfit_config.metric_template, payload,
+		       gfit_config.metric_template_length);
+		gfit_send_response(true);
+		break;
+	case GFIT_CMD_SET_CHANNEL_CONFIGURATION:
+		if (length >= 4U) {
+			gfit_config.channel_selector = payload[2];
+			gfit_config.channel_mask = payload[3];
+		}
+		gfit_send_response(length >= 4U);
+		break;
+	case GFIT_CMD_SET_DEVICE_INFO:
+		handle_device_info_command(payload, length);
+		break;
+	case GFIT_CMD_SET_HRP_PAIRING:
+	case GFIT_CMD_GET_VERSION:
+	case GFIT_CMD_HRP_DISCONNECT:
+		gfit_send_response(true);
+		break;
+	case GFIT_CMD_TRANSITION:
+		if (length >= 3U) {
+			gfit_config.state = payload[2];
+			if (gfit_config.state == GFIT_TRANSITION_READY) {
+				bridge_ready = true;
+				(void)ble_ftms_set_enabled(true);
+			}
+		}
+		gfit_send_response(length >= 3U);
+		break;
+	default:
+		gfit_send_response(true);
+		break;
+	}
+}
+
 static void handle_gfit_command(const uint8_t *payload, size_t length)
 {
 	if (length >= 2U && payload[1] == GFIT_METRIC_PACKET) {
@@ -232,20 +384,9 @@ static void handle_gfit_command(const uint8_t *payload, size_t length)
 		return;
 	}
 
-	if (length >= 2U && payload[1] == 0xd2U) {
-		bridge_ready = true;
-		(void)ble_ftms_set_enabled(true);
-		gfit_send_response(true);
-		return;
+	if (length >= 2U) {
+		handle_init_command(payload, length);
 	}
-
-	if (length >= 3U && payload[1] == 0xe5U) {
-		(void)ble_ftms_set_enabled(payload[2] != 0U);
-		gfit_send_response(true);
-		return;
-	}
-
-	gfit_send_response(true);
 }
 
 static void handle_gfit_payload(const uint8_t *payload, size_t length)
