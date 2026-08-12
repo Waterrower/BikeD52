@@ -1,5 +1,7 @@
 #include "ble_hr.h"
 
+#ifdef CONFIG_BT_CENTRAL
+
 #include <errno.h>
 #include <stddef.h>
 #include <string.h>
@@ -38,6 +40,17 @@ static uint32_t scan_started_ms;
 static uint8_t hr_bpm;
 static char hr_name[HR_NAME_MAX + 1U] = "Sensor";
 static int8_t hr_rssi;
+
+static void copy_bounded(char *dst, size_t dst_size, const char *src)
+{
+	size_t len = strlen(src);
+
+	if (len >= dst_size) {
+		len = dst_size - 1U;
+	}
+	memcpy(dst, src, len);
+	dst[len] = '\0';
+}
 
 static bool adv_parse(struct bt_data *data, void *user_data)
 {
@@ -96,7 +109,8 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			memcpy(best_candidate.name, context.name,
 			       sizeof(best_candidate.name));
 		} else {
-			strcpy(best_candidate.name, "HR Sensor");
+			copy_bounded(best_candidate.name,
+				     sizeof(best_candidate.name), "HR Sensor");
 		}
 	}
 }
@@ -113,6 +127,7 @@ static uint8_t notify_func(struct bt_conn *conn,
 		params->value_handle = 0U;
 		hr_state = BLE_HR_IDLE;
 		hr_bpm = 0U;
+		(void)ble_ftms_hrs_set_active(false);
 		return BT_GATT_ITER_STOP;
 	}
 
@@ -129,6 +144,8 @@ static uint8_t notify_func(struct bt_conn *conn,
 	} else {
 		hr_bpm = measurement[1];
 	}
+
+	(void)ble_ftms_notify_heart_rate(hr_bpm);
 
 	return BT_GATT_ITER_CONTINUE;
 }
@@ -182,6 +199,7 @@ static uint8_t discover_func(struct bt_conn *conn,
 	err = bt_gatt_subscribe(conn, &subscribe_params);
 	if (err == 0 || err == -EALREADY) {
 		hr_state = BLE_HR_CONNECTED;
+		(void)ble_ftms_hrs_set_active(true);
 	} else {
 		hr_state = BLE_HR_FAILED;
 	}
@@ -248,6 +266,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	if (hr_state == BLE_HR_CONNECTED || hr_state == BLE_HR_CONNECTING) {
 		hr_state = BLE_HR_IDLE;
 	}
+	(void)ble_ftms_hrs_set_active(false);
 }
 
 BT_CONN_CB_DEFINE(hr_conn_callbacks) = {
@@ -277,7 +296,7 @@ int ble_hr_start_pairing(void)
 	memset(&best_candidate, 0, sizeof(best_candidate));
 	hr_bpm = 0U;
 	hr_rssi = 0;
-	strcpy(hr_name, "Suche");
+	copy_bounded(hr_name, sizeof(hr_name), "Suche");
 
 	(void)ble_ftms_pause_advertising();
 
@@ -335,7 +354,7 @@ void ble_hr_process(void)
 
 	if (!best_candidate.found) {
 		hr_state = BLE_HR_FAILED;
-		strcpy(hr_name, "Kein Gurt");
+		copy_bounded(hr_name, sizeof(hr_name), "Kein Gurt");
 		return;
 	}
 
@@ -345,7 +364,7 @@ void ble_hr_process(void)
 				&hr_conn);
 	if (err != 0) {
 		hr_state = BLE_HR_FAILED;
-		strcpy(hr_name, "Fehler");
+		copy_bounded(hr_name, sizeof(hr_name), "Fehler");
 		return;
 	}
 
@@ -378,3 +397,50 @@ const char *ble_hr_get_name(void)
 {
 	return hr_name;
 }
+
+#else
+
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+int ble_hr_start_pairing(void)
+{
+	return -ENOTSUP;
+}
+
+int ble_hr_disconnect(void)
+{
+	return 0;
+}
+
+void ble_hr_process(void)
+{
+}
+
+enum ble_hr_state ble_hr_get_state(void)
+{
+	return BLE_HR_IDLE;
+}
+
+bool ble_hr_is_connected(void)
+{
+	return false;
+}
+
+uint8_t ble_hr_get_bpm(void)
+{
+	return 0U;
+}
+
+int8_t ble_hr_get_rssi(void)
+{
+	return 0;
+}
+
+const char *ble_hr_get_name(void)
+{
+	return "Sensor";
+}
+
+#endif

@@ -15,8 +15,10 @@
 #include <zephyr/drivers/uart.h>
 #include <zephyr/fs/nvs.h>
 #include <zephyr/storage/flash_map.h>
+#ifdef CONFIG_BOOTLOADER_MCUBOOT
+#include <zephyr/dfu/mcuboot.h>
+#endif
 
-#include "ant_hr.h"
 #include "ble_hr.h"
 #include "ble_ftms.h"
 #include "displayEnums.h"
@@ -33,6 +35,13 @@
 #define DISPLAY_RX_MAX 12
 #define DISPLAY_POLL_MS 5
 #define UART_RX_RING_SIZE 512
+#define DISPLAY_REARM_INTERVAL_MS 5000U
+#define DISPLAY_IDLE_DIM_MS 60000U
+#define DISPLAY_IDLE_OFF_MS 120000U
+#define DISPLAY_WAKE_SPLASH_MS 3500U
+#define DISPLAY_BRIGHTNESS_FULL 15U
+#define DISPLAY_BRIGHTNESS_DIM 10U
+#define DISPLAY_BRIGHTNESS_OFF 0U
 #define UART_DEVICE_NODE DT_NODELABEL(uart0)
 #define USER_NODE DT_PATH(zephyr_user)
 #define STORAGE_NODE DT_NODELABEL(storage_partition)
@@ -65,6 +74,7 @@
 #define SESSION_BIG_DISTANCE_STEP_LOW_M 1000U
 #define SESSION_SMALL_DISTANCE_STEP_HIGH_M 1000U
 #define SESSION_BIG_DISTANCE_STEP_HIGH_M 5000U
+#define BT_SESSION_END_DISCONNECT_DELAY_MS 750U
 #define APP_LANGUAGE_US 4U
 #define METERS_PER_MILE 1609U
 #define MAX_DISPLAY_PACE_SEC (30U * 60U)
@@ -127,9 +137,15 @@ struct ring_buffer {
 	volatile uint8_t buffer[UART_RX_RING_SIZE];
 };
 
+enum display_power_state {
+	DISPLAY_POWER_ACTIVE,
+	DISPLAY_POWER_DIM,
+	DISPLAY_POWER_OFF,
+};
+
 static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
 static bool app_darkmode;
-static bool app_bt_enabled;
+static bool app_bt_enabled = true;
 static uint8_t app_language = 1;
 static enum user_state user_state;
 static enum user_state last_user_state;
@@ -144,9 +160,12 @@ static bool countdown_active;
 static uint8_t countdown_mode;
 static uint8_t countdown_value;
 static uint32_t countdown_last_ms;
+static bool bt_connection_session_active;
+static bool last_ftms_connected;
 static bool confirm_stop_was_paused;
 static struct gpio_callback tick_input_cb;
 static volatile uint32_t cadence_edge_count;
+static volatile bool cadence_wake_pending;
 static uint16_t resistance_raw;
 static uint8_t measured_resistance_percent;
 static uint8_t measured_cadence_rpm;
@@ -154,12 +173,18 @@ static uint16_t resistance_cal_raw_100 = 210;
 static uint16_t resistance_cal_raw_0 = 980;
 static bool resistance_calibrated;
 static bool resistance_nvs_ready;
+static enum display_power_state display_power_state = DISPLAY_POWER_ACTIVE;
+static uint32_t display_last_activity_ms;
+static uint8_t display_brightness = 0xffU;
+static uint8_t wake_splash_index;
+static int hr_last_pairing_error;
+
+static void bt_disconnect_work_handler(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(bt_disconnect_work, bt_disconnect_work_handler);
 
 enum hr_search_mode {
 	HR_SEARCH_OFF,
 	HR_SEARCH_BLE,
-	HR_SEARCH_ANT,
-	HR_SEARCH_BLE_ANT,
 	HR_SEARCH_COUNT,
 };
 
@@ -175,6 +200,7 @@ enum app_page_id {
 	PAGE_INFORMATION,
 	PAGE_IMAGE_BROWSER,
 	PAGE_SESSION,
+	PAGE_BT_CONNECTION,
 	PAGE_SUMMARY,
 	PAGE_CONFIRM_STOP,
 };
@@ -352,6 +378,12 @@ static const uint8_t session_images[] = {
 	IMG_TILE3_RING_3_9,
 };
 
+static const uint8_t bt_connection_images[] = {
+	IMG_BG_GRID_LIGHT,
+	IMG_TILE0_NOHRD_LOGO,
+	IMG_HR_INDICATOR_ICON_OFF,
+};
+
 static const uint8_t summary_images[] = {
 	IMG_BG_GRID_LIGHT,
 	IMG_TILE0_FINISH,
@@ -380,6 +412,8 @@ static const char *const text_hr[] = {"HR Connect", "Puls", "Cardio", "Pulso", "
 static const char *const text_bt_off[] = {"BT Off", "BT Aus", "BT off", "BT off", "BT Off"};
 static const char *const text_bt_on[] = {"BT On", "BT An", "BT on", "BT on", "BT On"};
 static const char *const text_calibration[] = {"Calibration", "Kalibrierung", "Calibration", "Calibracion", "Calibration"};
+static const char *const text_cal_reset[] = {"Cal Reset", "Kal. Reset", "Cal. reset", "Cal. reset", "Cal Reset"};
+static const char *const text_reset_error[] = {"Reset Error", "Reset Fehler", "Erreur reset", "Error reset", "Reset Error"};
 static const char *const text_start[] = {"Start", "Start", "Depart", "Inicio", "Start"};
 static const char *const text_next[] = {"Next", "Weiter", "Suivant", "Siguiente", "Next"};
 static const char *const text_ble[] = {"BLE", "BLE", "BLE", "BLE", "BLE"};
@@ -418,6 +452,8 @@ static const char *const text_avg_pace[] = {"Avg Pace", "{ Pace", "{ Allure", "{
 static const char *const text_yes[] = {"Yes", "Ja", "Oui", "Si", "Yes"};
 static const char *const text_no[] = {"No", "Nein", "Non", "No", "No"};
 static const char *const text_quit[] = {"Quit?", "Beenden?", "Quitter?", "Salir?", "Quit?"};
+static const char *const text_end[] = {"End", "Ende", "Fin", "Fin", "End"};
+static const char *const text_bt[] = {"Bluetooth", "Bluetooth", "Bluetooth", "Bluetooth", "Bluetooth"};
 static const char text_distance_mi[] = "Distance/mi";
 static const char text_version_firmware[] = "FW 4.0.0";
 static const char text_version_display_fw[] = "DFW 1.0";
@@ -637,6 +673,12 @@ static const struct menu_button settings1_buttons[] = {
 
 static const struct menu_button settings2_buttons[] = {
 	{
+		.button_id = BTN_TILE0,
+		.action_id = BTN_ACTION_TILE0,
+		.text_field_id = SF_LABEL0_DARK,
+		.localized_text = text_settings,
+	},
+	{
 		.button_id = BTN_TILE1,
 		.action_id = BTN_ACTION_GOTO_INFO,
 		.image_id = IMG_TILE1_BLANK_LIGHT,
@@ -822,6 +864,18 @@ static const struct menu_button session_buttons[] = {
 	},
 };
 
+static const struct menu_button bt_connection_buttons[] = {
+	{
+		.button_id = BTN_TILE4B,
+		.action_id = BTN_ACTION_STOP_SESSION,
+		.image_id = IMG_HALFTILE41_BLANK_LIGHT,
+		.press_image_id = IMG_HALFTILE41_FRAME_LIGHT,
+		.text_field_id = SF_HALFTILE41_LABEL_LIGHT,
+		.localized_text = text_end,
+		.top_layer = IMG_HALFTILE41_DISCONBT_LIGHT,
+	},
+};
+
 static const struct menu_button summary_buttons[] = {
 	{
 		.button_id = BTN_TILE4,
@@ -962,6 +1016,13 @@ static const struct menu_page pages[] = {
 		.image_count = ARRAY_SIZE(session_images),
 		.buttons = session_buttons,
 		.button_count = ARRAY_SIZE(session_buttons),
+	},
+	[PAGE_BT_CONNECTION] = {
+		.page_id = PAGE_BT_CONNECTION,
+		.images = bt_connection_images,
+		.image_count = ARRAY_SIZE(bt_connection_images),
+		.buttons = bt_connection_buttons,
+		.button_count = ARRAY_SIZE(bt_connection_buttons),
 	},
 	[PAGE_SUMMARY] = {
 		.page_id = PAGE_SUMMARY,
@@ -1428,6 +1489,22 @@ static void display_show_image_raw(uint8_t image)
 	display_cmd(payload, sizeof(payload));
 }
 
+static void display_set_brightness(uint8_t brightness)
+{
+	uint8_t payload[] = {0xba, brightness};
+
+	if (display_brightness == brightness) {
+		return;
+	}
+
+	if (brightness == DISPLAY_BRIGHTNESS_OFF) {
+		display_show_image_raw(IMG_BG_BLACK);
+	}
+
+	display_cmd(payload, sizeof(payload));
+	display_brightness = brightness;
+}
+
 static void display_show_gif(uint8_t gif)
 {
 	uint8_t payload[] = {0x88, gif};
@@ -1496,10 +1573,6 @@ static const char *hr_search_mode_label(void)
 	switch (hr_search_mode) {
 	case HR_SEARCH_OFF:
 		return "AUS";
-	case HR_SEARCH_ANT:
-		return "ANT+";
-	case HR_SEARCH_BLE_ANT:
-		return "BLE+ANT";
 	case HR_SEARCH_BLE:
 	default:
 		return "BLE";
@@ -1508,14 +1581,7 @@ static const char *hr_search_mode_label(void)
 
 static bool hr_search_mode_has_ble(void)
 {
-	return hr_search_mode == HR_SEARCH_BLE ||
-	       hr_search_mode == HR_SEARCH_BLE_ANT;
-}
-
-static bool hr_search_mode_has_ant(void)
-{
-	return hr_search_mode == HR_SEARCH_ANT ||
-	       hr_search_mode == HR_SEARCH_BLE_ANT;
+	return hr_search_mode == HR_SEARCH_BLE;
 }
 
 static void cycle_hr_search_mode(void)
@@ -1523,7 +1589,6 @@ static void cycle_hr_search_mode(void)
 	hr_search_mode = (hr_search_mode + 1U) % HR_SEARCH_COUNT;
 	if (hr_search_mode == HR_SEARCH_OFF) {
 		(void)ble_hr_disconnect();
-		(void)ant_hr_disconnect();
 	}
 }
 
@@ -1617,11 +1682,43 @@ static void construct_page(enum app_page_id page_id)
 	}
 
 	active_page = page;
-	if (page_id == PAGE_SETTINGS_1 || page_id == PAGE_SETTINGS_2) {
+	if (page_id == PAGE_SETTINGS_1) {
 		display_show_text(SF_LABEL0_DARK, text_settings[app_language],
 				  strlen(text_settings[app_language]));
 	}
 	display_activate_swipe();
+}
+
+static void rearm_active_page_controls(void)
+{
+	if (active_page == NULL) {
+		return;
+	}
+
+	for (size_t i = 0; i < active_page->button_count; i++) {
+		const struct menu_button *button = &active_page->buttons[i];
+
+		if (button->action_id != BTN_ACTION_NONE) {
+			display_activate_button(button->button_id);
+		}
+	}
+
+	display_activate_swipe();
+}
+
+static void deactivate_active_page_controls(void)
+{
+	if (active_page == NULL) {
+		return;
+	}
+
+	for (size_t i = 0; i < active_page->button_count; i++) {
+		const struct menu_button *button = &active_page->buttons[i];
+
+		if (button->action_id != BTN_ACTION_NONE) {
+			display_deactivate_button(button->button_id);
+		}
+	}
 }
 
 static void show_information_page(void)
@@ -1650,10 +1747,6 @@ static void format_hr_bpm(char *buffer, size_t len)
 	uint8_t bpm = ble_hr_get_bpm();
 
 	if (bpm == 0U) {
-		bpm = ant_hr_get_bpm();
-	}
-
-	if (bpm == 0U) {
 		(void)snprintf(buffer, len, "---");
 	} else {
 		(void)snprintf(buffer, len, "%u", bpm);
@@ -1662,9 +1755,7 @@ static void format_hr_bpm(char *buffer, size_t len)
 
 static uint8_t hr_current_bpm(void)
 {
-	uint8_t bpm = ble_hr_get_bpm();
-
-	return bpm != 0U ? bpm : ant_hr_get_bpm();
+	return ble_hr_get_bpm();
 }
 
 static void show_hr_search_control(enum ble_hr_state state)
@@ -1722,7 +1813,6 @@ static void show_hr_status_lines(void)
 	const char *line4 = "";
 	const char *sensor = ble_hr_get_name();
 	enum ble_hr_state state = ble_hr_get_state();
-	enum ant_hr_state ant_state = ant_hr_get_state();
 
 	(void)snprintf(rssi, sizeof(rssi), "---");
 
@@ -1734,53 +1824,17 @@ static void show_hr_status_lines(void)
 		goto show_lines;
 	}
 
-	if (hr_search_mode == HR_SEARCH_ANT) {
-		switch (ant_state) {
-		case ANT_HR_SEARCHING:
-			line1 = "Suche...";
-			line2 = "ANT+";
-			line3 = "Gurt";
-			line4 = "";
-			break;
-		case ANT_HR_CONNECTED:
-			line1 = "Verbunden";
-			line2 = ant_hr_get_name();
-			line3 = "";
-			line4 = "";
-			break;
-		case ANT_HR_FAILED:
-			line1 = "Kein Gurt";
-			line2 = "Nochmal";
-			line3 = "ANT+";
-			line4 = "druecken";
-			break;
-		case ANT_HR_UNAVAILABLE:
-			line1 = "ANT+";
-			line2 = "Stack";
-			line3 = "fehlt";
-			line4 = "";
-			break;
-		case ANT_HR_IDLE:
-		default:
-			line1 = "Bereit";
-			line2 = "Gurt nah";
-			line3 = "druecken";
-			line4 = "";
-			break;
-		}
-		goto show_lines;
-	}
-
 	if (!hr_search_mode_has_ble()) {
-		line1 = "ANT+";
-		line2 = "noch";
-		line3 = "nicht";
-		line4 = "aktiv";
+		line1 = "Puls";
+		line2 = "aus";
+		line3 = "";
+		line4 = "";
 		goto show_lines;
 	}
 
 	switch (state) {
 	case BLE_HR_SCANNING:
+		hr_last_pairing_error = 0;
 		line1 = "Suche...";
 		line2 = "Gurt nah";
 		line3 = "halten";
@@ -1803,7 +1857,15 @@ static void show_hr_status_lines(void)
 		line1 = "Kein Gurt";
 		line2 = "Nochmal";
 		line3 = "BLE";
-		line4 = "druecken";
+		if (hr_last_pairing_error != 0) {
+			(void)snprintf(rssi, sizeof(rssi), "E%d",
+				       hr_last_pairing_error < 0 ?
+				       -hr_last_pairing_error :
+				       hr_last_pairing_error);
+			line4 = rssi;
+		} else {
+			line4 = "druecken";
+		}
 		break;
 	case BLE_HR_IDLE:
 	default:
@@ -1828,7 +1890,7 @@ show_lines:
 	display_show_text(SF_HALFTILE40_LINE2_LIGHT, "", 0);
 	display_show_text(SF_HALFTILE40_LINE3_LIGHT, "", 0);
 	show_hr_search_control(state);
-	display_show_image((ble_hr_is_connected() || ant_hr_is_connected()) ?
+	display_show_image(ble_hr_is_connected() ?
 			   IMG_HR_INDICATOR_ICON_ON :
 			   IMG_HR_INDICATOR_ICON_OFF);
 }
@@ -2098,10 +2160,10 @@ static void format_distance_step(char *buffer, size_t len, int32_t step_m)
 
 	tenths_mile = meters_to_tenths_mile(magnitude);
 	if (tenths_mile >= 10U && (tenths_mile % 10U) == 0U) {
-		(void)snprintf(buffer, len, "%c%umi", sign,
+		(void)snprintf(buffer, len, "%c%u", sign,
 			       (unsigned int)(tenths_mile / 10U));
 	} else {
-		(void)snprintf(buffer, len, "%c%u.%umi", sign,
+		(void)snprintf(buffer, len, "%c%u.%u", sign,
 			       (unsigned int)(tenths_mile / 10U),
 			       (unsigned int)(tenths_mile % 10U));
 	}
@@ -2149,14 +2211,14 @@ static void format_distance_value(char *buffer, size_t len, uint32_t distance_m)
 				   METERS_PER_MILE);
 
 		if (hundredths_mile >= 10000U) {
-			(void)snprintf(buffer, len, "%umi",
+			(void)snprintf(buffer, len, "%u",
 				       (unsigned int)((hundredths_mile + 50U) / 100U));
 		} else if (hundredths_mile >= 1000U) {
-			(void)snprintf(buffer, len, "%u.%umi",
+			(void)snprintf(buffer, len, "%u.%u",
 				       (unsigned int)(hundredths_mile / 100U),
 				       (unsigned int)((hundredths_mile / 10U) % 10U));
 		} else {
-			(void)snprintf(buffer, len, "%u.%02umi",
+			(void)snprintf(buffer, len, "%u.%02u",
 				       (unsigned int)(hundredths_mile / 100U),
 				       (unsigned int)(hundredths_mile % 100U));
 		}
@@ -2259,6 +2321,58 @@ static int save_resistance_calibration(void)
 			 &data, sizeof(data));
 }
 
+static int clear_resistance_calibration(void)
+{
+	int ret = 0;
+
+	resistance_cal_raw_100 = 210;
+	resistance_cal_raw_0 = 980;
+	resistance_calibrated = false;
+	measured_resistance_percent = 0;
+
+	if (resistance_nvs_ready) {
+		ret = nvs_delete(&resistance_nvs, RESISTANCE_CAL_NVS_ID);
+		if (ret == -ENOENT) {
+			ret = 0;
+		}
+	}
+
+	return ret;
+}
+
+static bool custom_ble_resistance_calibrated(void)
+{
+	return resistance_calibrated;
+}
+
+static int custom_ble_set_resistance_calibration(uint8_t value_id,
+						 const uint8_t *data,
+						 size_t len)
+{
+	uint16_t raw;
+
+	if (data == NULL || len < sizeof(raw)) {
+		return -EINVAL;
+	}
+
+	raw = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+
+	switch (value_id) {
+	case 0x00:
+	case 0x01:
+		resistance_cal_raw_100 = raw;
+		break;
+	case 0x02:
+		resistance_cal_raw_0 = raw;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	resistance_calibrated = resistance_cal_raw_100 != resistance_cal_raw_0;
+	return save_resistance_calibration();
+}
+
 static bool session_ring_preferences_valid(const struct session_ring_pref_data *data)
 {
 	if (data->magic != SESSION_RING_PREF_MAGIC) {
@@ -2298,8 +2412,7 @@ static bool ui_settings_valid(const struct ui_settings_data *data)
 	return data->magic == UI_SETTINGS_MAGIC &&
 	       data->language < ARRAY_SIZE(text_language) &&
 	       data->darkmode <= 1U &&
-	       data->bt_enabled <= 1U &&
-	       data->hr_search_mode < HR_SEARCH_COUNT;
+	       data->bt_enabled <= 1U;
 }
 
 static int save_ui_settings(void)
@@ -2693,6 +2806,94 @@ static void render_session_page(void)
 	update_session_values();
 }
 
+static void update_bt_connection_values(void)
+{
+	char value[12];
+
+	if (active_page == NULL || active_page->page_id != PAGE_BT_CONNECTION) {
+		return;
+	}
+
+	(void)snprintf(value, sizeof(value), "%u", session.watts);
+	display_show_text(SF_VALUE1_LIGHT, value, strlen(value));
+
+	(void)snprintf(value, sizeof(value), "%u", session.resistance_percent);
+	display_show_text(SF_VALUE2_LIGHT, value, strlen(value));
+
+	(void)snprintf(value, sizeof(value), "%u", session.heartrate_bpm);
+	display_show_text(SF_VALUE3_LIGHT, value, strlen(value));
+}
+
+static void render_bt_connection_page(void)
+{
+	construct_page(PAGE_BT_CONNECTION);
+	display_show_text(SF_LABEL0_DARK, text_bt[app_language],
+			  strlen(text_bt[app_language]));
+	display_show_text(SF_LABEL1_LIGHT, text_watts[app_language],
+			  strlen(text_watts[app_language]));
+	display_show_text(SF_LABEL2_LIGHT, text_resistance[app_language],
+			  strlen(text_resistance[app_language]));
+	display_show_text(SF_LABEL3_LIGHT, text_heartrate[app_language],
+			  strlen(text_heartrate[app_language]));
+	update_bt_connection_values();
+}
+
+static void bt_disconnect_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	(void)ble_ftms_disconnect();
+}
+
+static void start_bt_connection_session(void)
+{
+	(void)k_work_cancel_delayable(&bt_disconnect_work);
+	(void)ble_ftms_notify_session_started();
+
+	bt_connection_session_active = true;
+	countdown_active = false;
+	session.mode = SESSION_FREE;
+	session.active = true;
+	session.paused = false;
+	session.summary_active = false;
+	session.elapsed_sec = 0;
+	session.distance_m = 0;
+	session.watt_seconds = 0;
+	session.heartrate_sum = 0;
+	session.heartrate_samples = 0;
+	session.inactive_sec = 0;
+	session.calories = 0;
+	session.heartrate_bpm = 0;
+	session.max_heartrate_bpm = 0;
+
+	render_bt_connection_page();
+}
+
+static void end_bt_connection_session(void)
+{
+	(void)k_work_cancel_delayable(&bt_disconnect_work);
+
+	bt_connection_session_active = false;
+	session.active = false;
+	session.paused = false;
+	session.mode = SESSION_NONE;
+	session.summary_active = false;
+	construct_page(PAGE_MAIN_MENU);
+}
+
+static void handle_ftms_connection_state(void)
+{
+	bool connected = ble_ftms_is_connected();
+
+	if (connected && !last_ftms_connected) {
+		start_bt_connection_session();
+	} else if (!connected && last_ftms_connected) {
+		end_bt_connection_session();
+	}
+
+	last_ftms_connected = connected;
+}
+
 static void start_session(enum session_mode mode)
 {
 	session.mode = mode;
@@ -2763,6 +2964,137 @@ static void leave_summary(void)
 {
 	session.summary_active = false;
 	construct_page(PAGE_MAIN_MENU);
+}
+
+static void rebuild_active_page_after_wake(enum app_page_id page_id)
+{
+	switch (page_id) {
+	case PAGE_TIME_SELECTION:
+	case PAGE_DISTANCE_SELECTION:
+		show_preselection_page(page_id);
+		break;
+	case PAGE_HR_CONNECT:
+		show_hr_connect_page();
+		break;
+	case PAGE_INFORMATION:
+		show_information_page();
+		break;
+	case PAGE_IMAGE_BROWSER:
+		construct_page(PAGE_IMAGE_BROWSER);
+		show_image_browser_asset();
+		break;
+	case PAGE_SESSION:
+		render_session_page();
+		break;
+	case PAGE_BT_CONNECTION:
+		render_bt_connection_page();
+		break;
+	case PAGE_SUMMARY:
+		show_summary();
+		break;
+	case PAGE_CONFIRM_STOP:
+		show_stop_confirmation();
+		break;
+	case PAGE_MAIN_MENU:
+	case PAGE_SETTINGS_1:
+	case PAGE_SETTINGS_2:
+	case PAGE_SETUP:
+	case PAGE_CALIBRATION:
+	default:
+		construct_page(page_id);
+		break;
+	}
+}
+
+static void display_show_wake_splash(void)
+{
+	display_show_image_raw(IMG_BG_SS_1 + wake_splash_index);
+	wake_splash_index = (wake_splash_index + 1U) % 4U;
+	display_set_brightness(DISPLAY_BRIGHTNESS_FULL);
+	k_msleep(DISPLAY_WAKE_SPLASH_MS);
+}
+
+static void display_show_boot_splash(void)
+{
+	display_show_image_raw(IMG_BG_BOOT);
+	display_set_brightness(DISPLAY_BRIGHTNESS_FULL);
+	k_msleep(DISPLAY_WAKE_SPLASH_MS);
+}
+
+static void wake_display(void)
+{
+	enum app_page_id page_id = PAGE_MAIN_MENU;
+
+	if (active_page != NULL) {
+		page_id = active_page->page_id;
+	}
+
+	display_power_state = DISPLAY_POWER_ACTIVE;
+	display_last_activity_ms = k_uptime_get_32();
+	display_show_wake_splash();
+	display_last_activity_ms = k_uptime_get_32();
+	rebuild_active_page_after_wake(page_id);
+}
+
+static bool display_standby_allowed(void)
+{
+	return active_page != NULL &&
+	       !countdown_active &&
+	       !session.active &&
+	       !session.summary_active &&
+	       active_page->page_id != PAGE_BT_CONNECTION;
+}
+
+static void display_note_activity(void)
+{
+	display_last_activity_ms = k_uptime_get_32();
+
+	if (display_power_state != DISPLAY_POWER_ACTIVE) {
+		wake_display();
+	}
+}
+
+static void display_power_update(void)
+{
+	uint32_t now_ms = k_uptime_get_32();
+	uint32_t elapsed_ms;
+
+	if (cadence_wake_pending) {
+		cadence_wake_pending = false;
+		if (display_power_state != DISPLAY_POWER_ACTIVE) {
+			wake_display();
+			return;
+		}
+		display_last_activity_ms = now_ms;
+	}
+
+	if (!display_standby_allowed()) {
+		if (display_power_state != DISPLAY_POWER_ACTIVE) {
+			wake_display();
+			return;
+		}
+		display_last_activity_ms = now_ms;
+		return;
+	}
+
+	elapsed_ms = now_ms - display_last_activity_ms;
+
+	if (elapsed_ms >= DISPLAY_IDLE_OFF_MS &&
+	    display_power_state != DISPLAY_POWER_OFF) {
+		deactivate_active_page_controls();
+		display_set_brightness(DISPLAY_BRIGHTNESS_OFF);
+		display_activate_button(BTN_WAKEUP);
+		display_power_state = DISPLAY_POWER_OFF;
+		return;
+	}
+
+	if (elapsed_ms >= DISPLAY_IDLE_DIM_MS &&
+	    display_power_state == DISPLAY_POWER_ACTIVE) {
+		deactivate_active_page_controls();
+		display_set_brightness(DISPLAY_BRIGHTNESS_DIM);
+		display_activate_button(BTN_WAKEUP);
+		display_power_state = DISPLAY_POWER_DIM;
+	}
 }
 
 static void cycle_session_ring(uint8_t ring_index, int8_t direction)
@@ -2856,7 +3188,6 @@ static void update_hr_connect_page(void)
 	uint32_t now_ms = k_uptime_get_32();
 
 	ble_hr_process();
-	ant_hr_process();
 
 	if (active_page == NULL || active_page->page_id != PAGE_HR_CONNECT) {
 		return;
@@ -2874,7 +3205,6 @@ static void run_button_action(uint8_t action_id)
 {
 	int ret;
 	enum ble_hr_state hr_state;
-	enum ant_hr_state ant_state;
 
 	switch (action_id) {
 	case BTN_ACTION_TOGGLE_LANGUAGE:
@@ -3021,6 +3351,12 @@ static void run_button_action(uint8_t action_id)
 		}
 		break;
 	case BTN_ACTION_STOP_SESSION:
+		if (active_page != NULL && active_page->page_id == PAGE_BT_CONNECTION) {
+			(void)ble_ftms_notify_session_ended();
+			(void)k_work_reschedule(&bt_disconnect_work,
+						 K_MSEC(BT_SESSION_END_DISCONNECT_DELAY_MS));
+			break;
+		}
 		if (session.active) {
 			show_stop_confirmation();
 		}
@@ -3043,24 +3379,21 @@ static void run_button_action(uint8_t action_id)
 		break;
 	case BTN_ACTION_REFRESH_HR:
 		hr_state = ble_hr_get_state();
-		ant_state = ant_hr_get_state();
 		if ((hr_state == BLE_HR_CONNECTED ||
 		     hr_state == BLE_HR_CONNECTING ||
-		     hr_state == BLE_HR_SCANNING) ||
-		    (ant_state == ANT_HR_CONNECTED ||
-		     ant_state == ANT_HR_SEARCHING)) {
+		     hr_state == BLE_HR_SCANNING)) {
 			if (hr_search_mode_has_ble()) {
 				(void)ble_hr_disconnect();
 			}
-			if (hr_search_mode_has_ant()) {
-				(void)ant_hr_disconnect();
-			}
 		} else {
-			if (hr_search_mode_has_ant()) {
-				(void)ant_hr_start_pairing();
+			if (!hr_search_mode_has_ble()) {
+				hr_search_mode = HR_SEARCH_BLE;
+				(void)save_ui_settings();
+				show_button(&hr_connect_buttons[1], false);
 			}
 			if (hr_search_mode_has_ble()) {
-				(void)ble_hr_start_pairing();
+				ret = ble_hr_start_pairing();
+				hr_last_pairing_error = ret;
 			}
 		}
 		show_hr_status_lines();
@@ -3073,6 +3406,18 @@ static void run_button_action(uint8_t action_id)
 		break;
 	case BTN_ACTION_RETURN_FROM_INFO:
 		construct_page(PAGE_MAIN_MENU);
+		break;
+	case BTN_ACTION_TILE0:
+		if (active_page != NULL &&
+		    active_page->page_id == PAGE_SETTINGS_2) {
+			const char *status;
+
+			ret = clear_resistance_calibration();
+			status = ret == 0 ? text_cal_reset[app_language] :
+					    text_reset_error[app_language];
+			construct_page(PAGE_SETTINGS_2);
+			display_show_text(SF_LABEL0_DARK, status, strlen(status));
+		}
 		break;
 	case BTN_ACTION_TILE3:
 		if (active_page != NULL &&
@@ -3141,6 +3486,21 @@ static void act_on_user_event(void)
 	if (user_state == last_user_state) {
 		return;
 	}
+
+	if (display_power_state != DISPLAY_POWER_ACTIVE) {
+		wake_display();
+		button_pressed = 0;
+		last_user_state = user_state;
+		return;
+	}
+
+	if (app_response_id == BTN_WAKEUP) {
+		button_pressed = 0;
+		last_user_state = user_state;
+		return;
+	}
+
+	display_note_activity();
 
 	switch (user_state) {
 	case USER_PRESS:
@@ -3375,6 +3735,7 @@ static void tick_input_handler(const struct device *port,
 	ARG_UNUSED(pins);
 
 	cadence_edge_count++;
+	cadence_wake_pending = true;
 }
 
 static int init_resistance_storage(void)
@@ -3433,8 +3794,9 @@ static int init_resistance_storage(void)
 	if (ret == sizeof(ui_data) && ui_settings_valid(&ui_data)) {
 		app_language = ui_data.language;
 		app_darkmode = ui_data.darkmode != 0U;
-		app_bt_enabled = ui_data.bt_enabled != 0U;
-		hr_search_mode = (enum hr_search_mode)ui_data.hr_search_mode;
+		app_bt_enabled = true;
+		hr_search_mode = ui_data.hr_search_mode == HR_SEARCH_OFF ?
+				 HR_SEARCH_OFF : HR_SEARCH_BLE;
 	}
 
 	return 0;
@@ -3555,6 +3917,7 @@ static void update_cadence_input(void)
 static void simulated_bike_training_update(void)
 {
 	static uint32_t last_notify_ms;
+	static uint32_t last_display_rearm_ms;
 #if ENABLE_SIMULATED_BIKE_TRAINING
 	static uint16_t phase;
 #endif
@@ -3610,7 +3973,9 @@ static void simulated_bike_training_update(void)
 		session.distance_m += speed_centi_kmh / 360U;
 		session.watt_seconds += power_watt;
 		session.calories = (uint16_t)((session.elapsed_sec * session.watts) / 4184U);
-		if (cadence_rpm > 0U || speed_centi_kmh > 0U || power_watt > 0U) {
+		if (bt_connection_session_active) {
+			session.inactive_sec = 0;
+		} else if (cadence_rpm > 0U || speed_centi_kmh > 0U || power_watt > 0U) {
 			session.inactive_sec = 0;
 		} else if (session.inactive_sec < SESSION_INACTIVITY_TIMEOUT_SEC) {
 			session.inactive_sec++;
@@ -3649,7 +4014,20 @@ static void simulated_bike_training_update(void)
 	if (finish_session) {
 		show_summary();
 	} else if (advance_session) {
-		update_session_values();
+		if ((active_page != NULL &&
+		     (active_page->page_id == PAGE_SESSION ||
+		      active_page->page_id == PAGE_BT_CONNECTION)) &&
+		    (uint32_t)(now_ms - last_display_rearm_ms) >=
+			    DISPLAY_REARM_INTERVAL_MS) {
+			rearm_active_page_controls();
+			last_display_rearm_ms = now_ms;
+		}
+
+		if (bt_connection_session_active) {
+			update_bt_connection_values();
+		} else {
+			update_session_values();
+		}
 	} else if (session.summary_active) {
 		update_summary_values();
 	}
@@ -3688,23 +4066,50 @@ int main(void)
 
 	uart_irq_rx_enable(uart_dev);
 
-	(void)ble_ftms_init();
-	(void)ant_hr_init();
-	(void)init_resistance_storage();
+	bool boot_healthy = true;
+
+	if (ble_ftms_init() != 0) {
+		boot_healthy = false;
+	}
+
+	if (init_resistance_storage() != 0) {
+		boot_healthy = false;
+	}
+	ble_ftms_set_calibration_handlers(custom_ble_resistance_calibrated,
+					  custom_ble_set_resistance_calibration);
+
 	if (app_bt_enabled) {
 		(void)ble_ftms_set_enabled(true);
 	}
-	(void)init_training_inputs();
 
+	if (init_training_inputs() != 0) {
+		boot_healthy = false;
+	}
+
+	display_show_boot_splash();
 	construct_page(PAGE_MAIN_MENU);
+	display_last_activity_ms = k_uptime_get_32();
+
+#ifdef CONFIG_BOOTLOADER_MCUBOOT
+	/* Only confirm the running image once BLE/storage/input init
+	 * succeeded; otherwise leave it unconfirmed so MCUboot reverts
+	 * to the previous image on the next reset. */
+	if (boot_healthy) {
+		(void)boot_write_img_confirmed();
+	}
+#else
+	(void)boot_healthy;
+#endif
 
 	while (1) {
 		(void)update_resistance_input();
 		display_poll_rx();
 		act_on_user_event();
 		countdown_update();
+		handle_ftms_connection_state();
 		update_hr_connect_page();
 		simulated_bike_training_update();
+		display_power_update();
 
 		k_msleep(DISPLAY_POLL_MS);
 	}

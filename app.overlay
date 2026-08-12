@@ -18,6 +18,23 @@
 			bias-pull-up;
 		};
 	};
+
+	spi1_default: spi1_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 19)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 20)>,
+				<NRF_PSEL(SPIM_MISO, 0, 22)>;
+		};
+	};
+
+	spi1_sleep: spi1_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 19)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 20)>,
+				<NRF_PSEL(SPIM_MISO, 0, 22)>;
+			low-power-enable;
+		};
+	};
 };
 
 &uart0 {
@@ -26,7 +43,47 @@
 	/delete-property/ hw-flow-control;
 };
 
+&spi1 {
+	compatible = "nordic,nrf-spim";
+	status = "okay";
+	pinctrl-0 = <&spi1_default>;
+	pinctrl-1 = <&spi1_sleep>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio0 24 GPIO_ACTIVE_LOW>;
+
+	external_flash: flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <1000000>;
+		jedec-id = [9d 60 14];
+		size = <0x800000>;
+	};
+};
+
 / {
+	chosen {
+		nordic,pm-ext-flash = &external_flash;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		debug_led0: debug_led_0 {
+			gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;
+			label = "SPI_OK_GREEN";
+		};
+
+		debug_led1: debug_led_1 {
+			gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;
+			label = "SPI_ERROR_RED";
+		};
+	};
+
+	aliases {
+		debug-led0 = &debug_led0;
+		debug-led1 = &debug_led1;
+	};
+
 	zephyr,user {
 		io-channels = <&adc 1>;
 		tick-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
