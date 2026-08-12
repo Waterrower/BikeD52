@@ -7,3 +7,17 @@
 
 # local snapshots
 *.bak_*
+
+# secrets
+/keys/
+*.pem
+
+# generated firmware artifacts / large binary snapshots
+/artifacts/
+/nohrd_legacy_gfit_app/build/
+
+# large vendor reference docs (keep locally, not in history)
+*.pdf
+
+# stray debug capture
+/src/Log*.txt
