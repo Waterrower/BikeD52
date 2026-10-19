@@ -42,6 +42,9 @@
 #define DISPLAY_BRIGHTNESS_FULL 15U
 #define DISPLAY_BRIGHTNESS_DIM 10U
 #define DISPLAY_BRIGHTNESS_OFF 0U
+#define DEV_MODE_UNLOCK_TAPS 8U
+#define DEV_PAGE_FLASH_TEST_OFFSET 0x72000U
+#define DEV_PAGE_FLASH_TEST_SIZE 4096U
 #define UART_DEVICE_NODE DT_NODELABEL(uart0)
 #define USER_NODE DT_PATH(zephyr_user)
 #define STORAGE_NODE DT_NODELABEL(storage_partition)
@@ -203,6 +206,7 @@ enum app_page_id {
 	PAGE_BT_CONNECTION,
 	PAGE_SUMMARY,
 	PAGE_CONFIRM_STOP,
+	PAGE_DEVELOPER,
 };
 
 enum session_mode {
@@ -365,6 +369,14 @@ static const uint8_t information_images[] = {
 	IMG_HALFTILE41_HOME_ICON_LIGHT,
 	IMG_HALFTILE40_VERSION_NUMBER,
 	IMG_HR_INDICATOR_ICON_OFF,
+};
+
+static const uint8_t developer_images[] = {
+	IMG_BG_GRID_LIGHT,
+	IMG_TILE0_INFO_ICON,
+	IMG_TILE1_NOHRD_INFO,
+	IMG_TILE3_BLANK_LIGHT,
+	IMG_HALFTILE41_HOME_ICON_LIGHT,
 };
 
 static const uint8_t image_browser_images[] = {
@@ -805,6 +817,16 @@ static const struct menu_button information_buttons[] = {
 	},
 };
 
+static const struct menu_button developer_buttons[] = {
+	{
+		.button_id = BTN_TILE4B,
+		.action_id = BTN_ACTION_GOTO_MAIN_MENU,
+		.image_id = IMG_HALFTILE41_BLANK_LIGHT,
+		.press_image_id = IMG_HALFTILE41_FRAME_LIGHT,
+		.top_layer = IMG_HALFTILE41_HOME_ICON_LIGHT,
+	},
+};
+
 static const struct menu_button image_browser_buttons[] = {
 	{
 		.button_id = BTN_TILE4,
@@ -1003,6 +1025,13 @@ static const struct menu_page pages[] = {
 		.buttons = information_buttons,
 		.button_count = ARRAY_SIZE(information_buttons),
 	},
+	[PAGE_DEVELOPER] = {
+		.page_id = PAGE_DEVELOPER,
+		.images = developer_images,
+		.image_count = ARRAY_SIZE(developer_images),
+		.buttons = developer_buttons,
+		.button_count = ARRAY_SIZE(developer_buttons),
+	},
 	[PAGE_IMAGE_BROWSER] = {
 		.page_id = PAGE_IMAGE_BROWSER,
 		.images = image_browser_images,
@@ -1044,7 +1073,6 @@ static const struct menu_page *active_page;
 static uint8_t button_pressed;
 static struct session_state session;
 static uint8_t dev_mode_unlock_counter;
-static bool dev_mode_unlocked;
 struct image_browser_asset {
 	uint8_t image_id;
 	const char *name;
@@ -1723,6 +1751,8 @@ static void deactivate_active_page_controls(void)
 
 static void show_information_page(void)
 {
+	dev_mode_unlock_counter = 0;
+
 	construct_page(PAGE_INFORMATION);
 	display_show_text_raw(SF_HALFTILE40_LINE2_LIGHT, text_version_firmware,
 			      strlen(text_version_firmware));
@@ -1740,6 +1770,85 @@ static void show_information_page(void)
 			  strlen(text_info_line3[app_language]));
 	display_show_text(SF_INFO_LINE4_LIGHT, text_info_line4[app_language],
 			  strlen(text_info_line4[app_language]));
+}
+
+static const char *run_external_flash_test(void)
+{
+	static char result[24];
+	const struct device *ext_flash_dev = DEVICE_DT_GET(DT_NODELABEL(external_flash));
+	static const uint8_t pattern[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+	uint8_t readback[sizeof(pattern)] = {0};
+	int ret;
+
+	if (!device_is_ready(ext_flash_dev)) {
+		snprintf(result, sizeof(result), "Flash: not ready");
+		return result;
+	}
+
+	ret = flash_erase(ext_flash_dev, DEV_PAGE_FLASH_TEST_OFFSET,
+			  DEV_PAGE_FLASH_TEST_SIZE);
+	if (ret == 0) {
+		ret = flash_write(ext_flash_dev, DEV_PAGE_FLASH_TEST_OFFSET,
+				  pattern, sizeof(pattern));
+	}
+	if (ret == 0) {
+		ret = flash_read(ext_flash_dev, DEV_PAGE_FLASH_TEST_OFFSET,
+				 readback, sizeof(readback));
+	}
+
+	if (ret == 0 && memcmp(pattern, readback, sizeof(pattern)) == 0) {
+		snprintf(result, sizeof(result), "Flash: OK");
+	} else {
+		snprintf(result, sizeof(result), "Flash: FAIL (%d)", ret);
+	}
+
+	return result;
+}
+
+static void show_developer_page(void)
+{
+	char line0[24];
+	char line1[24];
+	const char *flash_status;
+
+	construct_page(PAGE_DEVELOPER);
+	display_show_text(SF_LABEL0_DARK, "Developer", strlen("Developer"));
+
+	snprintf(line0, sizeof(line0), "Resistance raw: %u", resistance_raw);
+	display_show_text(SF_INFO_LINE0_LIGHT, line0, strlen(line0));
+
+	snprintf(line1, sizeof(line1), "Cadence pin: %d",
+		gpio_pin_get_dt(&tick_input));
+	display_show_text(SF_INFO_LINE1_LIGHT, line1, strlen(line1));
+
+	flash_status = run_external_flash_test();
+	display_show_text(SF_INFO_LINE2_LIGHT, flash_status, strlen(flash_status));
+	display_show_text(SF_INFO_LINE3_LIGHT, "", 0);
+	display_show_text(SF_INFO_LINE4_LIGHT, "", 0);
+}
+
+static void update_developer_page(void)
+{
+	static uint32_t last_update_ms;
+	uint32_t now_ms = k_uptime_get_32();
+	char line0[24];
+	char line1[24];
+
+	if (active_page == NULL || active_page->page_id != PAGE_DEVELOPER) {
+		return;
+	}
+
+	if ((uint32_t)(now_ms - last_update_ms) < 250U) {
+		return;
+	}
+	last_update_ms = now_ms;
+
+	snprintf(line0, sizeof(line0), "Resistance raw: %u", resistance_raw);
+	display_show_text(SF_INFO_LINE0_LIGHT, line0, strlen(line0));
+
+	snprintf(line1, sizeof(line1), "Cadence pin: %d",
+		gpio_pin_get_dt(&tick_input));
+	display_show_text(SF_INFO_LINE1_LIGHT, line1, strlen(line1));
 }
 
 static void format_hr_bpm(char *buffer, size_t len)
@@ -2979,6 +3088,9 @@ static void rebuild_active_page_after_wake(enum app_page_id page_id)
 	case PAGE_INFORMATION:
 		show_information_page();
 		break;
+	case PAGE_DEVELOPER:
+		show_developer_page();
+		break;
 	case PAGE_IMAGE_BROWSER:
 		construct_page(PAGE_IMAGE_BROWSER);
 		show_image_browser_asset();
@@ -3399,10 +3511,11 @@ static void run_button_action(uint8_t action_id)
 		show_hr_status_lines();
 		break;
 	case BTN_ACTION_UNLOCK_DEV_MODE:
-		if (dev_mode_unlock_counter < 15U) {
-			dev_mode_unlock_counter++;
+		dev_mode_unlock_counter++;
+		if (dev_mode_unlock_counter >= DEV_MODE_UNLOCK_TAPS) {
+			dev_mode_unlock_counter = 0;
+			show_developer_page();
 		}
-		dev_mode_unlocked = dev_mode_unlock_counter >= 15U;
 		break;
 	case BTN_ACTION_RETURN_FROM_INFO:
 		construct_page(PAGE_MAIN_MENU);
@@ -4108,6 +4221,7 @@ int main(void)
 		countdown_update();
 		handle_ftms_connection_state();
 		update_hr_connect_page();
+		update_developer_page();
 		simulated_bike_training_update();
 		display_power_update();
 
